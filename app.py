@@ -1,108 +1,81 @@
-import hashlib
+import os, re, hashlib
 from datetime import datetime
-from typing import List, Optional
-
+from urllib.parse import quote_plus, urljoin
+import httpx
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
-
-from playwright.async_api import async_playwright
+from selectolax.parser import HTMLParser
+from dateutil import parser as dparser
 
 app = FastAPI()
 
-API_TOKEN = ""  # nadamy w Railway przez zmienną środowiskową
+# Ustawimy to w Railway (adres strony wyników; {q} = fraza)
+SEARCH_URL_TEMPLATE = os.getenv("SEARCH_URL_TEMPLATE", "")
+API_TOKEN = os.getenv("API_TOKEN", "")
+
+DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4})")
 
 class SearchReq(BaseModel):
     q: str = Field(..., description="fraza, np. 'fundacja rodzinna'")
+    date_from: str | None = Field(None, description="YYYY-MM-DD")
     limit: int = Field(10, ge=1, le=50)
 
-class Item(BaseModel):
-    title: str
-    url: str
-    date: Optional[str] = None
-    snippet: Optional[str] = None
-    id: str
+def normalize_date(s: str):
+    m = DATE_RE.search(s or "")
+    if not m: return None
+    try:
+        dt = dparser.parse(m.group(1), dayfirst=True, fuzzy=True)
+        return dt.date().isoformat()
+    except Exception:
+        return None
 
-class SearchResp(BaseModel):
-    count: int
-    results: List[Item]
+def extract_results(html: str, base: str):
+    doc = HTMLParser(html)
+    out = []
+    for a in doc.css('a[href]'):
+        href = a.attributes.get('href','')
+        text = (a.text() or '').strip()
+        if not href or not text: 
+            continue
+        # heurystyka: linki do podglądu interpretacji
+        if "/informacje/podglad/" not in href and "interpret" not in href.lower():
+            continue
+        url = urljoin(base, href)
+        # kontekst w okolicy linku
+        block = a.parent
+        ctx = block.text(separator=" ", strip=True) if block else text
+        date = normalize_date(ctx)
+        snippet = " ".join(ctx.split())[:240]
+        item = {"title": text, "url": url, "date": date, "snippet": snippet}
+        if not any(x["url"] == url for x in out):
+            out.append(item)
+    # limit i hash
+    res = out[:50]
+    for it in res:
+        it["id"] = hashlib.md5((it["url"] + (it.get("date") or "")).encode("utf-8")).hexdigest()
+    return res
 
-async def _scrape_eureka(query: str, limit: int) -> List[dict]:
-    # Otwieramy Eurekę w przeglądarce bezgłowej, wpisujemy frazę, bierzemy linki do interpretacji
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        # 1) Strona główna
-        await page.goto("https://eureka.mf.gov.pl/", wait_until="domcontentloaded")
-
-        # 2) Pole wyszukiwania: spróbujemy po placeholderze/aria-labelu i po tekście przycisku
-        # (Selektory są ogólne, ale stabilne: jeśli UI się zmieni, dostosujemy)
-        # Spróbuj znaleźć input:
-        input_locator = page.locator('input[placeholder*="fra"] , input[aria-label*="szuk"], input[type="search"]')
-        await input_locator.first().fill(query)
-
-        # Przyciski "Szukaj":
-        search_btn = page.locator('button:has-text("Szukaj"), input[type="submit"]')
-        await search_btn.first().click()
-
-        # 3) Poczekaj aż pojawią się wyniki z linkami do podglądu interpretacji
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_selector('a[href*="/informacje/podglad/"]', timeout=15000)
-
-        links = page.locator('a[href*="/informacje/podglad/"]')
-        count = await links.count()
-        out = []
-        for i in range(min(count, limit*2)):  # bierzemy trochę więcej, odfiltrujemy duplikaty
-            href = await links.nth(i).get_attribute("href")
-            title = (await links.nth(i).inner_text()).strip()
-            if not href or not title:
-                continue
-            url = page.url.split("/szukaj")[0] + href if href.startswith("/") else href
-
-            # Kontekst (data + krótki opis) z najbliższego kontenera
-            block = links.nth(i).locator("xpath=ancestor-or-self::*[self::a or self::div or self::li][1]")
-            ctx_text = ""
-            try:
-                ctx_text = (await block.inner_text()).strip()
-            except:
-                pass
-
-            # Proste wyłuskanie daty (YYYY-MM-DD albo DD.MM.RRRR)
-            date = None
-            import re
-            m = re.search(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", ctx_text)
-            if m:
-                raw = m.group(1)
-                # normalizacja do YYYY-MM-DD
-                try:
-                    from dateutil import parser as dparser
-                    dt = dparser.parse(raw, dayfirst=True, fuzzy=True)
-                    date = dt.date().isoformat()
-                except:
-                    date = None
-
-            snippet = " ".join(ctx_text.split())[:240] if ctx_text else None
-            _id = hashlib.md5((url + (date or "")).encode("utf-8")).hexdigest()
-
-            item = {"title": title, "url": url, "date": date, "snippet": snippet, "id": _id}
-            # unikaj duplikatów po URL
-            if not any(x["url"] == url for x in out):
-                out.append(item)
-
-            if len(out) >= limit:
-                break
-
-        await context.close()
-        await browser.close()
-        return out
-
-@app.post("/eureka_search", response_model=SearchResp)
+@app.post("/eureka_search")
 async def eureka_search(req: SearchReq, authorization: str = Header(default="")):
-    global API_TOKEN
-    # prosta autoryzacja przez nagłówek
     if API_TOKEN and authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(401, "unauthorized")
+    if not SEARCH_URL_TEMPLATE or "{q}" not in SEARCH_URL_TEMPLATE:
+        raise HTTPException(500, "SEARCH_URL_TEMPLATE not configured")
 
-    results = await _scrape_eureka(req.q, req.limit)
-    return {"count": len(results), "results": results}
+    url = SEARCH_URL_TEMPLATE.format(q=quote_plus(req.q.strip()))
+    async with httpx.AsyncClient(timeout=20, headers={"User-Agent":"eureka-bot/1.0"}) as client:
+        r = await client.get(url)
+        if r.status_code != 200:
+            raise HTTPException(502, f"search status {r.status_code}")
+        items = extract_results(r.text, str(r.url))
+
+    # filtr po dacie
+    if req.date_from:
+        try:
+            df = datetime.strptime(req.date_from, "%Y-%m-%d").date()
+            items = [x for x in items if x.get("date") and datetime.strptime(x["date"], "%Y-%m-%d").date() >= df]
+        except ValueError:
+            pass
+
+    items = items[:req.limit]
+    return {"count": len(items), "results": items}
