@@ -1,16 +1,11 @@
-import os, hashlib
-from typing import List
 from fastapi import FastAPI, HTTPException, Header, Query
-from pydantic import BaseModel, Field
-from playwright.async_api import async_playwright
+from pydantic import BaseModel
+from typing import List
+import os
 
 app = FastAPI()
 
-# --------- MODELE ----------
-class SearchReq(BaseModel):
-    q: str = Field(..., description="fraza, np. 'fundacja rodzinna'")
-    limit: int = Field(5, ge=1, le=20)
-
+# MODELE
 class Item(BaseModel):
     title: str
     url: str
@@ -19,88 +14,35 @@ class Resp(BaseModel):
     count: int
     results: List[Item]
 
-# --------- PING ------------
+# PROSTA AUTORYZACJA (nagłówek Bearer ALBO query ?token=)
+def check_auth(authorization: str, token_q: str | None):
+    token_env = os.getenv("API_TOKEN", "")
+    if not token_env:
+        return
+    if authorization == f"Bearer {token_env}":
+        return
+    if token_q == token_env:
+        return
+    raise HTTPException(401, "unauthorized")
+
+# ROUTES
 @app.get("/ping")
-async def ping():
+def ping():
     return {"ok": True}
 
-# --------- WSPÓLNA LOGIKA ---------
-async def do_search(query: str, limit: int) -> Resp:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(locale="pl-PL")
-        page = await context.new_page()
-
-        await page.goto("https://eureka.mf.gov.pl/", wait_until="domcontentloaded")
-
-        # pole wyszukiwania – kilka możliwych selektorów
-        selectors = [
-            'input[type="search"]',
-            'input[placeholder*="fra"]',
-            'input[aria-label*="zuk"]',
-            'input[aria-label*="szuk"]'
-        ]
-        found = False
-        for sel in selectors:
-            if await page.locator(sel).first().count():
-                await page.locator(sel).first().fill(query)
-                found = True
-                break
-        if not found:
-            await browser.close()
-            raise HTTPException(502, "search box not found")
-
-        # klik „Szukaj”
-        btn = page.locator('button:has-text("Szukaj"), input[type="submit"]')
-        await btn.first().click()
-
-        # poczekaj na wyniki i zbierz linki do podglądu interpretacji
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_selector('a[href*="/informacje/podglad/"]', timeout=25000)
-        links = page.locator('a[href*="/informacje/podglad/"]')
-        n = await links.count()
-
-        out = []
-        for i in range(min(n, limit)):
-            href = await links.nth(i).get_attribute("href")
-            title = (await links.nth(i).inner_text()).strip()
-            if not href:
-                continue
-            url = href if href.startswith("http") else page.url.split("/szukaj")[0] + href
-            if not any(x["url"] == url for x in out):
-                out.append({"title": title or "Interpretacja", "url": url})
-
-        await context.close()
-        await browser.close()
-        return {"count": len(out), "results": out}
-
-# --------- AUTORYZACJA ---------
-def check_auth(authorization: str, token_qparam: str | None):
-    token_env = os.getenv("API_TOKEN", "")
-    # pozwalamy albo na nagłówek, albo na ?token= dla łatwego testu w przeglądarce
-    if token_env:
-        if authorization == f"Bearer {token_env}":
-            return
-        if token_qparam == token_env:
-            return
-        raise HTTPException(401, "unauthorized")
-
-# --------- ENDPOINTY GET/POST ---------
 @app.get("/eureka_search", response_model=Resp)
-async def eureka_search_get(
+def eureka_search_get(
     q: str = Query(...),
-    limit: int = Query(5),
+    limit: int = Query(5, ge=1, le=20),
     token: str | None = Query(None),
     authorization: str = Header(default="")
 ):
     check_auth(authorization, token)
-    return await do_search(q.strip(), limit)
-
-@app.post("/eureka_search", response_model=Resp)
-async def eureka_search_post(
-    req: SearchReq,
-    token: str | None = Query(None),
-    authorization: str = Header(default="")
-):
-    check_auth(authorization, token)
-    return await do_search(req.q.strip(), req.limit)
+    # TU JESZCZE NIE SCRAPUJEMY — zwracamy PRZYKŁADOWE dane,
+    # żeby sprawdzić n8n→Telegram.
+    examples = [
+        {"title": "Fundacja rodzinna – przykład 1", "url": "https://eureka.mf.gov.pl/informacje/podglad/123"},
+        {"title": "Fundacja rodzinna – przykład 2", "url": "https://eureka.mf.gov.pl/informacje/podglad/456"},
+        {"title": "Fundacja rodzinna – przykład 3", "url": "https://eureka.mf.gov.pl/informacje/podglad/789"},
+    ]
+    return {"count": min(limit, len(examples)), "results": examples[:limit]}
