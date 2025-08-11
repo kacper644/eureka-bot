@@ -63,13 +63,33 @@ async def eureka_search(req: SearchReq, authorization: str = Header(default=""))
         raise HTTPException(500, "SEARCH_URL_TEMPLATE not configured")
 
     url = SEARCH_URL_TEMPLATE.format(q=quote_plus(req.q.strip()))
-    async with httpx.AsyncClient(timeout=20, headers={"User-Agent":"eureka-bot/1.0"}) as client:
+    async with httpx.AsyncClient(timeout=20, headers={"User-Agent":"eureka-bot/1.0", "Accept-Language":"pl"}) as client:
         r = await client.get(url)
         if r.status_code != 200:
             raise HTTPException(502, f"search status {r.status_code}")
-        items = extract_results(r.text, str(r.url))
+        html = r.text
 
-    # filtr po dacie
+    # 1) spróbuj normalnego parsera (nasz dotychczasowy)
+    items = extract_results(html, url)
+
+    # 2) jeśli nic nie znalazł – zwróć tryb diagnostyczny: wszystkie <a href>
+    if not items:
+        doc = HTMLParser(html)
+        links = []
+        for a in doc.css('a[href]'):
+            href = a.attributes.get('href','')
+            text = (a.text() or '').strip()
+            if not href: 
+                continue
+            links.append({
+                "href": urljoin(url, href),
+                "text": text[:160]
+            })
+            if len(links) >= min(req.limit*10, 200):
+                break
+        return {"count": 0, "results": [], "debug_links": links}
+
+    # 3) filtrowanie po dacie (gdy mamy items)
     if req.date_from:
         try:
             df = datetime.strptime(req.date_from, "%Y-%m-%d").date()
@@ -79,3 +99,4 @@ async def eureka_search(req: SearchReq, authorization: str = Header(default=""))
 
     items = items[:req.limit]
     return {"count": len(items), "results": items}
+
