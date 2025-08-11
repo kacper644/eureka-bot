@@ -1,7 +1,4 @@
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates && rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/playwright/python:v1.47.2-jammy
 
 WORKDIR /app
 COPY requirements.txt .
